@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -154,12 +153,10 @@ func ValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
 	// if jwt != "" {
 	if jwt == "" {
 		// If the module is configured to allow public access with no authentication, return 200 now
-		if cfg.Cfg.PublicAccess {
-			w.Header().Add(cfg.Cfg.Headers.User, "")
-			log.Debugf("no jwt found, but public access is '%v', returning ok200", cfg.Cfg.PublicAccess)
-			ok200(w, r)
-		} else {
+		if !cfg.Cfg.PublicAccess {
 			error401(w, r, AuthError{Error: "no jwt found in request"})
+		} else {
+			w.Header().Add(cfg.Cfg.Headers.User, "")
 		}
 		return
 	}
@@ -209,10 +206,7 @@ func ValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
 				if cv == k {
 					log.Debug("Found matching claim key: ", k)
 					customHeader := strings.Join([]string{cfg.Cfg.Headers.ClaimHeader, k}, "")
-					// convert to string
-					val := fmt.Sprint(v)
-					if reflect.TypeOf(val).Kind() == reflect.String {
-						// if val, ok := v.(string); ok {
+					if val, ok := v.(string); ok {
 						w.Header().Add(customHeader, val)
 						log.Debug("Adding header for claim: ", k, " Name: ", customHeader, " Value: ", val)
 					} else if val, ok := v.([]interface{}); ok {
@@ -223,7 +217,7 @@ func ValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
 						log.Debug("Adding header for claim: ", k, " Name: ", customHeader, " Value: ", strings.Join(strs, ","))
 						w.Header().Add(customHeader, strings.Join(strs, ","))
 					} else {
-						log.Errorf("Couldn't parse header type for %s %+v.  Please submit an issue.", k, v)
+						log.Error("Couldn't parse header type.  Please submit an issue.")
 					}
 				}
 			}
@@ -287,10 +281,18 @@ func ValidateRequestHandler(w http.ResponseWriter, r *http.Request) {
 // currently performs a 302 redirect to Google
 func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	log.Debug("/logout")
+
+	jwt := FindJWT(r)
+	
+	log.Debug("LOGOUT JWT:",jwt)
+
+	claims, err := ClaimsFromJWT(jwt)
+
+	log.Debug("LOGOUT TOKEN:", claims.PIdToken)
 	cookie.ClearCookie(w, r)
 
 	log.Debug("saving session")
-	sessstore.MaxAge(-1)
+	//ssessstore.MaxAge(-1)
 	session, err := sessstore.Get(r, cfg.Cfg.Session.Name)
 	if err != nil {
 		log.Error(err)
@@ -301,8 +303,12 @@ func LogoutHandler(w http.ResponseWriter, r *http.Request) {
 	sessstore.MaxAge(300)
 
 	var requestedURL = r.URL.Query().Get("url")
+	req, err := http.NewRequest("GET", requestedURL, nil)
+	q := req.URL.Query()
+	q.Add("id_token_hint", claims.PIdToken)
+	req.URL.RawQuery = q.Encode()
 	if requestedURL != "" {
-		redirect302(w, r, requestedURL)
+		redirect302(w, r, req.URL.String())
 	} else {
 		renderIndex(w, "/logout you have been logged out")
 	}
@@ -537,15 +543,7 @@ func getUserInfo(r *http.Request, user *structs.User, customClaims *structs.Cust
 		client := cfg.OAuthClient.Client(context.TODO(), providerToken)
 		return getUserInfoFromOpenStax(client, user, customClaims, providerToken)
 	}
-
-	if (providerToken.Extra("id_token") != nil) {
-		// Certain providers (eg. gitea) don't provide an id_token
-		// and it's not neccessary for the authentication phase
-		ptokens.PIdToken = providerToken.Extra("id_token").(string)
-	} else {
-		log.Debugf("id_token missing - may not be supported by this provider")
-	}
-
+	ptokens.PIdToken = providerToken.Extra("id_token").(string)
 	log.Debugf("ptokens: %+v", ptokens)
 
 	// make the "third leg" request back to provider to exchange the token for the userinfo
@@ -826,28 +824,15 @@ func getUserInfoFromADFS(r *http.Request, user *structs.User, customClaims *stru
 		log.Error(err)
 		return nil
 	}
-	log.Debugf("idToken: %+v", string(idToken))
 
 	adfsUser := structs.ADFSUser{}
 	json.Unmarshal([]byte(idToken), &adfsUser)
 	log.Infof("adfs adfsUser: %+v", adfsUser)
-	// data contains an access token, refresh token, and id token
-	// Please note that in order for custom claims to work you MUST set allatclaims in ADFS to be passed
-	// https://oktotechnologies.ca/2018/08/26/adfs-openidconnect-configuration/
-	if err = mapClaims([]byte(idToken), customClaims); err != nil {
+	if err = mapClaims(data, customClaims); err != nil {
 		log.Error(err)
 		return err
 	}
 	adfsUser.PrepareUserData()
-	var rxEmail = regexp.MustCompile("^[a-zA-Z0-9.!#$%&'*+\\/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$")
-
-	if len(adfsUser.Email) == 0 {
-		// If the email is blank, we will try to determine if the UPN is an email.
-		if rxEmail.MatchString(adfsUser.UPN) {
-			// Set the email from UPN if there is a valid email present.
-			adfsUser.Email = adfsUser.UPN
-		}
-	}
 	user.Username = adfsUser.Username
 	user.Email = adfsUser.Email
 	log.Debugf("User Obj: %+v", user)
